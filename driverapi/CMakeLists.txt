@@ -6,6 +6,11 @@ set(
         src/memcopy.cpp
         modules/rm_ioctl/rm_ioctl.cpp
         modules/uvm_ioctl/uvm_ioctl.cpp
+        modules/device_management/device_management.cpp
+        modules/context_management/context_management.cpp
+        modules/memory_management/memory_management.cpp
+        modules/stream_management/stream_management.cpp
+        modules/kernel_launch/kernel_launch.cpp
         internal/memcopy.h
         internal/memcopy_kernels.h
 )

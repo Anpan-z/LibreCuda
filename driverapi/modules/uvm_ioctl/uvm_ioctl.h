@@ -8,8 +8,11 @@ extern "C" {
 #endif
 
 // UVM (Unified Virtual Memory) ioctl operations
-libreCudaStatus_t uvmInitialize();
+libreCudaStatus_t uvmInit();
 libreCudaStatus_t uvmInitializeMM();
+
+// Get UVM file descriptor
+int uvmGetFd();
 
 #ifdef __cplusplus
 }
