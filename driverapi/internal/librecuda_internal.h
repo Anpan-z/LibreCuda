@@ -2,6 +2,7 @@
 #define LIBRECUDA_LIBRECUDA_INTERNAL_H
 
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -201,5 +202,9 @@ bool isDevicePtr(void *ptr);
  * @return true if the pointer is a device pointer and mapped to host. will return false for host pointers.
  */
 bool isHostMappedPtr(void *ptr);
+
+void libreCudaTestConfigureHostAllocRuntime(LibreCUcontext ctx, NvHandle rootHandle, int ctlFd, int uvmFd);
+
+void libreCudaTestResetHostAllocRuntime();
 
 #endif //LIBRECUDA_LIBRECUDA_INTERNAL_H

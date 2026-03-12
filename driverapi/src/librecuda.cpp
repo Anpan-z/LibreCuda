@@ -38,6 +38,7 @@
 #include <sstream>
 #include <vector>
 #include <cstring>
+#include <cerrno>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -648,6 +649,209 @@ libreCudaStatus_t libreCuCtxSetCurrent(LibreCUcontext ctx) {
 
 static std::vector<std::pair<NvU64, NvU64> > hostMappedPtrs{};
 static std::unordered_map<NvU64, NvHandle> va_to_mem_handle{};
+static constexpr NvU64 HOST_ALLOC_GRANULARITY = 2UL * 1024UL * 1024UL;
+
+struct HostMemoryAllocation {
+    LibreCUcontext ctx;
+    NvHandle memory_handle;
+    NvU64 base;
+    size_t length;
+};
+
+static std::unordered_map<NvU64, HostMemoryAllocation> host_memory_allocations{};
+
+extern "C" int libreCudaTestHostAllocIoctl(int fd, unsigned long request, void *data) __attribute__((weak));
+extern "C" void *
+libreCudaTestHostAllocMmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+    __attribute__((weak));
+extern "C" int libreCudaTestHostAllocMunmap(void *addr, size_t length) __attribute__((weak));
+
+static inline libreCudaStatus_t mapErrnoToStatus(int err) {
+    switch (err) {
+        case ENOMEM:
+            return LIBRECUDA_ERROR_OUT_OF_MEMORY;
+        case EINVAL:
+            return LIBRECUDA_ERROR_INVALID_VALUE;
+        case ENODEV:
+        case ENOENT:
+            return LIBRECUDA_ERROR_INVALID_DEVICE;
+        default:
+            return LIBRECUDA_ERROR_UNKNOWN;
+    }
+}
+
+static inline unsigned long makeNvRequest(unsigned int nr, size_t dataSize) {
+    return (3UL << 30) | ((dataSize & 0x1FFFUL) << 16) | (static_cast<unsigned long>('F') << 8) | (nr & 0xFFUL);
+}
+
+static inline int hostAllocIoctl(int fd, unsigned long request, void *data) {
+    if (libreCudaTestHostAllocIoctl != nullptr) {
+        return libreCudaTestHostAllocIoctl(fd, request, data);
+    }
+    return ioctl(fd, request, data);
+}
+
+static inline void *hostAllocMmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    if (libreCudaTestHostAllocMmap != nullptr) {
+        return libreCudaTestHostAllocMmap(addr, length, prot, flags, fd, offset);
+    }
+    return mmap(addr, length, prot, flags, fd, offset);
+}
+
+static inline int hostAllocMunmap(void *addr, size_t length) {
+    if (libreCudaTestHostAllocMunmap != nullptr) {
+        return libreCudaTestHostAllocMunmap(addr, length);
+    }
+    return munmap(addr, length);
+}
+
+static libreCudaStatus_t hostAllocRmAllocMemory(LibreCUcontext ctx, void *hostPointer, size_t size, NvHandle *pMemoryHandleOut) {
+    LIBRECUDA_VALIDATE(ctx != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(hostPointer != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(pMemoryHandleOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+
+    nv_ioctl_nvos02_parameters_with_fd parameters{
+        .params = {
+            .hRoot = root,
+            .hObjectParent = ctx->device_handle,
+            .hObjectNew = 0,
+            .hClass = NV01_MEMORY_SYSTEM_OS_DESCRIPTOR,
+            .flags = 0x40001010,
+            .pMemory = hostPointer,
+            .limit = size - 1,
+            .status = 0
+        },
+        .fd = -1
+    };
+
+    int ret = hostAllocIoctl(ctx->device_fd, makeNvRequest(NV_ESC_RM_ALLOC_MEMORY, sizeof(parameters)), &parameters);
+    if (ret != 0) {
+        LIBRECUDA_FAIL(mapErrnoToStatus(errno));
+    }
+    if (parameters.params.status != 0) {
+        LIBRECUDA_FAIL(LIBRECUDA_ERROR_UNKNOWN);
+    }
+
+    *pMemoryHandleOut = parameters.params.hObjectNew;
+    LIBRECUDA_SUCCEED();
+}
+
+static libreCudaStatus_t hostAllocCreateExternalRange(NvU64 base, size_t size) {
+    UVM_CREATE_EXTERNAL_RANGE_PARAMS params{
+        .base = base,
+        .length = size
+    };
+    int ret = hostAllocIoctl(fd_uvm, UVM_CREATE_EXTERNAL_RANGE, &params);
+    if (ret != 0) {
+        LIBRECUDA_FAIL(mapErrnoToStatus(errno));
+    }
+    if (params.rmStatus != 0) {
+        LIBRECUDA_FAIL(LIBRECUDA_ERROR_UNKNOWN);
+    }
+    LIBRECUDA_SUCCEED();
+}
+
+static libreCudaStatus_t hostAllocMapExternalAllocation(LibreCUcontext ctx, NvHandle memoryHandle, NvU64 base, size_t size) {
+    LIBRECUDA_VALIDATE(ctx != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    UVM_MAP_EXTERNAL_ALLOCATION_PARAMS params{
+        .base = base,
+        .length = size,
+        .offset = 0,
+        .perGpuAttributes = {
+            {
+                .gpuUuid = ctx->device->uuid,
+                .gpuMappingType = UvmGpuMappingTypeReadWriteAtomic
+            }
+        },
+        .gpuAttributesCount = 1,
+        .rmCtrlFd = fd_ctl,
+        .hClient = root,
+        .hMemory = memoryHandle
+    };
+    int ret = hostAllocIoctl(fd_uvm, UVM_MAP_EXTERNAL_ALLOCATION, &params);
+    if (ret != 0) {
+        LIBRECUDA_FAIL(mapErrnoToStatus(errno));
+    }
+    if (params.rmStatus != 0) {
+        LIBRECUDA_FAIL(LIBRECUDA_ERROR_UNKNOWN);
+    }
+    LIBRECUDA_SUCCEED();
+}
+
+static libreCudaStatus_t hostAllocUnmapExternal(LibreCUcontext ctx, NvU64 base, size_t size) {
+    LIBRECUDA_VALIDATE(ctx != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    UVM_UNMAP_EXTERNAL_PARAMS params{
+        .base = base,
+        .length = size,
+        .gpuUuid = ctx->device->uuid
+    };
+    int ret = hostAllocIoctl(fd_uvm, UVM_UNMAP_EXTERNAL, &params);
+    if (ret != 0) {
+        LIBRECUDA_FAIL(mapErrnoToStatus(errno));
+    }
+    if (params.rmStatus != 0) {
+        LIBRECUDA_FAIL(LIBRECUDA_ERROR_UNKNOWN);
+    }
+    LIBRECUDA_SUCCEED();
+}
+
+static libreCudaStatus_t hostAllocFreeExternalRange(NvU64 base, size_t size) {
+    UVM_FREE_PARAMS params{
+        .base = base,
+        .length = size
+    };
+    int ret = hostAllocIoctl(fd_uvm, UVM_FREE, &params);
+    if (ret != 0) {
+        LIBRECUDA_FAIL(mapErrnoToStatus(errno));
+    }
+    if (params.rmStatus != 0) {
+        LIBRECUDA_FAIL(LIBRECUDA_ERROR_UNKNOWN);
+    }
+    LIBRECUDA_SUCCEED();
+}
+
+static libreCudaStatus_t hostAllocRmFree(LibreCUcontext ctx, NvHandle memoryHandle) {
+    LIBRECUDA_VALIDATE(ctx != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    NVOS00_PARAMETERS params{
+        .hRoot = root,
+        .hObjectParent = ctx->device_handle,
+        .hObjectOld = memoryHandle
+    };
+    int ret = hostAllocIoctl(fd_ctl, makeNvRequest(NV_ESC_RM_FREE, sizeof(params)), &params);
+    if (ret != 0) {
+        LIBRECUDA_FAIL(mapErrnoToStatus(errno));
+    }
+    if (params.status != 0) {
+        LIBRECUDA_FAIL(LIBRECUDA_ERROR_UNKNOWN);
+    }
+    LIBRECUDA_SUCCEED();
+}
+
+static libreCudaStatus_t freeHostMemoryAllocation(const HostMemoryAllocation &allocation) {
+    libreCudaStatus_t status = LIBRECUDA_SUCCESS;
+
+    libreCudaStatus_t step_status = hostAllocUnmapExternal(allocation.ctx, allocation.base, allocation.length);
+    if (status == LIBRECUDA_SUCCESS && step_status != LIBRECUDA_SUCCESS) {
+        status = step_status;
+    }
+
+    step_status = hostAllocFreeExternalRange(allocation.base, allocation.length);
+    if (status == LIBRECUDA_SUCCESS && step_status != LIBRECUDA_SUCCESS) {
+        status = step_status;
+    }
+
+    step_status = hostAllocRmFree(allocation.ctx, allocation.memory_handle);
+    if (status == LIBRECUDA_SUCCESS && step_status != LIBRECUDA_SUCCESS) {
+        status = step_status;
+    }
+
+    if (hostAllocMunmap(reinterpret_cast<void *>(allocation.base), allocation.length) != 0 &&
+        status == LIBRECUDA_SUCCESS) {
+        status = mapErrnoToStatus(errno);
+    }
+
+    return status;
+}
 
 
 libreCudaStatus_t memUVMMap(LibreCUcontext ctx, NvHandle memoryHandle, NvU64 virtualAddress, size_t size) {
@@ -746,6 +950,47 @@ libreCudaStatus_t libreCuMemAlloc(void **pDevicePointer, size_t bytesize, bool m
         );
     }
     *pDevicePointer = reinterpret_cast<void *>(va_address);
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuMemAllocHost(void **pHostPointer, size_t bytesize) {
+    LIBRECUDA_VALIDATE(pHostPointer != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(bytesize > 0, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ENSURE_CTX_VALID();
+
+    size_t alloc_size = ceilDiv(bytesize, HOST_ALLOC_GRANULARITY) * HOST_ALLOC_GRANULARITY;
+    void *host_pointer = hostAllocMmap(nullptr, alloc_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    LIBRECUDA_VALIDATE(host_pointer != MAP_FAILED, mapErrnoToStatus(errno));
+
+    NvHandle memory_handle{};
+    libreCudaStatus_t status = hostAllocRmAllocMemory(current_ctx, host_pointer, alloc_size, &memory_handle);
+    if (status != LIBRECUDA_SUCCESS) {
+        hostAllocMunmap(host_pointer, alloc_size);
+        return status;
+    }
+
+    status = hostAllocCreateExternalRange(reinterpret_cast<NvU64>(host_pointer), alloc_size);
+    if (status != LIBRECUDA_SUCCESS) {
+        hostAllocRmFree(current_ctx, memory_handle);
+        hostAllocMunmap(host_pointer, alloc_size);
+        return status;
+    }
+
+    status = hostAllocMapExternalAllocation(current_ctx, memory_handle, reinterpret_cast<NvU64>(host_pointer), alloc_size);
+    if (status != LIBRECUDA_SUCCESS) {
+        hostAllocFreeExternalRange(reinterpret_cast<NvU64>(host_pointer), alloc_size);
+        hostAllocRmFree(current_ctx, memory_handle);
+        hostAllocMunmap(host_pointer, alloc_size);
+        return status;
+    }
+
+    host_memory_allocations[reinterpret_cast<NvU64>(host_pointer)] = HostMemoryAllocation{
+        .ctx = current_ctx,
+        .memory_handle = memory_handle,
+        .base = reinterpret_cast<NvU64>(host_pointer),
+        .length = alloc_size
+    };
+    *pHostPointer = host_pointer;
     LIBRECUDA_SUCCEED();
 }
 
@@ -868,6 +1113,38 @@ libreCudaStatus_t libreCuMemFree(void *devicePointer) {
     LIBRECUDA_ERR_PROPAGATE(gpuFree(current_ctx, reinterpret_cast<NvU64>(devicePointer)));
 
     LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuMemFreeHost(void *hostPointer) {
+    LIBRECUDA_VALIDATE(hostPointer != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ENSURE_CTX_VALID();
+
+    auto it = host_memory_allocations.find(reinterpret_cast<NvU64>(hostPointer));
+    if (it == host_memory_allocations.end()) {
+        LIBRECUDA_FAIL(LIBRECUDA_ERROR_INVALID_VALUE);
+    }
+
+    libreCudaStatus_t status = freeHostMemoryAllocation(it->second);
+    if (status == LIBRECUDA_SUCCESS) {
+        host_memory_allocations.erase(it);
+    }
+    return status;
+}
+
+void libreCudaTestConfigureHostAllocRuntime(LibreCUcontext ctx, NvHandle rootHandle, int ctlFd, int uvmFd) {
+    current_ctx = ctx;
+    root = rootHandle;
+    fd_ctl = ctlFd;
+    fd_uvm = uvmFd;
+    host_memory_allocations.clear();
+}
+
+void libreCudaTestResetHostAllocRuntime() {
+    current_ctx = nullptr;
+    root = 0;
+    fd_ctl = 0;
+    fd_uvm = 0;
+    host_memory_allocations.clear();
 }
 
 libreCudaStatus_t libreCuMemCpy(void *dst, void *src, size_t byteCount, LibreCUstream stream, bool async) {

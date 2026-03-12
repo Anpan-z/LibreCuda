@@ -1,0 +1,14 @@
+add_executable(
+        test_host_alloc
+        main.cpp
+)
+target_link_libraries(
+        test_host_alloc
+        PRIVATE
+        driverapi
+)
+target_include_directories(
+        test_host_alloc
+        PRIVATE
+        ${CMAKE_SOURCE_DIR}/driverapi/internal
+)
