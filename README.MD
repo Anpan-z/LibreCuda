@@ -8,6 +8,7 @@ structure. LibreCUDA is capable of uploading CUDA ELF binaries onto the GPU and 
 ## Current features
 
 - Allocate and free gpu memory & map the memory to be accessible by the CPU
+- Allocate and free page-locked host memory via `libreCuMemAllocHost` / `libreCuMemFreeHost`
 - Upload cuda kernels (CUDA ELF binaries)
 - Set dynamic shared memory for cuda functions
 - Launch CUDA kernels
@@ -145,6 +146,26 @@ target_link_libraries(YourTarget PRIVATE driverapi)
 ```c
 #include <librecuda.h>
 ```
+
+## Host Memory API
+
+LibreCUDA also exposes page-locked host allocation helpers:
+
+```cpp
+void *host_buffer{};
+libreCuMemAllocHost(&host_buffer, 4096);
+std::memset(host_buffer, 0xAB, 4096);
+libreCuMemFreeHost(host_buffer);
+```
+
+- `libreCuMemAllocHost(void **pHostPointer, size_t bytesize)` returns `LIBRECUDA_ERROR_INVALID_VALUE` for a null
+  output pointer or zero-sized request.
+- `libreCuMemFreeHost(void *hostPointer)` follows the existing free-style validation and returns
+  `LIBRECUDA_ERROR_INVALID_VALUE` for null, unknown, or already-freed host pointers.
+- The implementation follows the traced `cuMemAllocHost_v2` flow: reserve host pages, allocate
+  `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR`, then register/map the external range through UVM.
+- Current trace evidence only covers a 2 MiB rounded allocation granularity on Linux/NVIDIA driver stacks, so the
+  implementation rounds host allocations up to 2 MiB and should be treated as trace-constrained behavior.
 
 ## Project Status
 

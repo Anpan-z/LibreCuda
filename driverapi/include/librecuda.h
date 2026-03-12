@@ -52,9 +52,13 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxGetCurrent(LibreCUcontext *pCtxOut)
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemAlloc(void **pDevicePointer, size_t bytesize, bool mapToCpu = false);
 
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemAllocHost(void **pHostPointer, size_t bytesize);
+
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemCpy(void *dst, void *src, size_t byteCount, LibreCUstream stream, bool async = false);
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemFree(void *devicePointer);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemFreeHost(void *hostPointer);
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamCreate(LibreCUstream *pStreamOut, uint32_t flags);
 
