@@ -22,7 +22,7 @@ constexpr int kFakeUvmFd = 12;
 constexpr NvHandle kFakeRootHandle = 0xc1d98e38;
 constexpr NvHandle kFakeDeviceHandle = 0x5c000002;
 constexpr NvHandle kFakeMemoryHandle = 0x5c000088;
-constexpr size_t kHostAllocGranularity = 2 << 20;
+constexpr size_t kHostAllocGranularity = 2UL * 1024UL * 1024UL;
 
 enum class FailurePoint {
     None,

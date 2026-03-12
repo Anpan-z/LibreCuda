@@ -649,7 +649,7 @@ libreCudaStatus_t libreCuCtxSetCurrent(LibreCUcontext ctx) {
 
 static std::vector<std::pair<NvU64, NvU64> > hostMappedPtrs{};
 static std::unordered_map<NvU64, NvHandle> va_to_mem_handle{};
-static constexpr NvU64 HOST_ALLOC_GRANULARITY = 2 << 20;
+static constexpr NvU64 HOST_ALLOC_GRANULARITY = 2UL * 1024UL * 1024UL;
 
 struct HostMemoryAllocation {
     LibreCUcontext ctx;
